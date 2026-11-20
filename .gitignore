@@ -44,3 +44,4 @@ Thumbs.db
 
 # Redshift archive run summaries
 redshift_archive_*.json
+redshift_restore_*.json

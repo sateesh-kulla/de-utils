@@ -19,11 +19,11 @@ python -m pip install -r requirements.txt
 ### Sign in AWS with sdm name which has write acess
 
 ```
-sdm connect aws-is-dev-us-east-1-write-cli
+sdm connect aws-is-dev-us-east-1-write
 ```
 
 ```bash
-python archive_redshift_tables.py \
+sdm aws --name "aws-is-dev-us-east-1-write" run python archive_redshift_tables.py \
   --sdm-name redshift-is-dev-admin \
   --database dev \
   --schema bronze \
@@ -103,3 +103,35 @@ Review and run `ddl.sql`. For a restore test, edit the destination table/schema 
 - [UNLOAD and verbose manifests](https://docs.aws.amazon.com/redshift/latest/dg/r_UNLOAD.html)
 - [SHOW TABLE](https://docs.aws.amazon.com/redshift/latest/dg/r_SHOW_TABLE.html)
 - [Transaction isolation](https://docs.aws.amazon.com/redshift/latest/dg/c_serial_isolation.html)
+
+## Restore archived tables
+
+The S3 root must be the prefix **before** `DATABASE/SCHEMA/TABLE/`. This version reads the flat table archive layout with `ddl.sql`, `metadata.json`, and `data/manifest` directly under each table folder; it does not discover older timestamp/run-ID subfolders.
+
+Preview restoring one table into a test schema:
+
+```bash
+sdm connect aws-is-dev-us-east-1-write-cli
+sdm aws --name aws-is-dev-us-east-1-write-cli run python restore_redshift_tables.py \
+  --sdm-name redshift-is-dev-admin \
+  --database dev \
+  --schema bronze \
+  --table br_labor_master \
+  --s3-prefix <REPLACE_WITH_S3_BUCKET_PATH> \
+  --iam-role <REPLACE_WITH_ROLE> \
+  --test --dry-run
+```
+
+- Remove `--dry-run` to perform the restore. Dry run reads and validates S3 artifacts, connects to the database and checks for existing destination objects; it creates no schemas/tables and runs no COPY. It writes no local summary unless `--summary-file` is explicitly supplied.
+- Omit `--table` to process every immediate table archive folder in the selected schema, with pagination.
+- `--test` uses a persistent schema named `<schema>_tmp`, such as `bronze_tmp`, keeping original table names. It is not a session-local temporary schema and remains available for validation afterward.
+- Omit `--test` to restore to the original schema. Existing destination objects are errors, never overwritten, dropped, truncated, or appended to.
+- Each archive must have completed metadata, a matching DDL checksum, and a valid verbose manifest. Manifest row counts must match the archived source/export counts, and each listed object's size/location is checked.
+- The script changes only the CREATE TABLE destination in the saved DDL and removes `IF NOT EXISTS`. DDL names must match the selected archive; multiple SQL statements are rejected. Other DDL content, including foreign-key references and defaults, stays as archived. Referenced tables/schemas may need to exist before restoration; this is not a dependency-ordered database restore.
+- For each table, CREATE SCHEMA (if needed), CREATE TABLE, COPY, and COUNT run in one explicit transaction. COUNT must equal the manifest total before COMMIT. A failed table is rolled back and remaining tables continue. Empty archives without data files create only the table and verify zero rows.
+- If connection is lost during COMMIT, outcome can be uncertain: inspect the destination before retrying. A completed table is not rolled back because another table fails.
+- By default, a local `redshift_restore_<timestamp>.json` records results, expected/restored counts, and errors. Use `--summary-file PATH` to choose its path. Exit codes: 0 all succeeded/ready, 1 any failure, 130 interrupted.
+- Restored ownership is the connected user; saved ownership and permissions are not automatically reapplied. Row count agreement does not replace business validation.
+- Python needs S3 list/read access (and any required KMS decrypt access). Redshift needs CREATE/USAGE privileges for the destination and authority to use the COPY IAM role. The role needs access to the archived data. The bucket and destination Redshift cluster must meet Parquet COPY region requirements.
+
+Restoration has been verified with mocked S3/Redshift tests only; no live restore was executed while developing the tool.
