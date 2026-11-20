@@ -206,11 +206,65 @@ def verify_manifest(s3, bucket, data_prefix, manifest, expected_rows):
     return {'exported_rows': rows, 'data_files': len(entries), 'data_bytes': size}
 
 
+TABLE_PRIVILEGES = {'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'REFERENCES', 'DROP', 'ALTER', 'TRUNCATE'}
+CATALOG_ONLY_PRIVILEGES = {'RULE', 'TRIGGER'}
+
+
+def normalize_table_grants(grants):
+    if not isinstance(grants, list):
+        raise ArchiveError('Typed table grant list is missing or invalid')
+    normalized, ignored = {}, []
+    for grant in grants:
+        if not isinstance(grant, dict):
+            raise ArchiveError('Invalid table grant entry')
+        kind = grant.get('identity_type')
+        name = grant.get('identity_name')
+        privilege = grant.get('privilege_type')
+        option = grant.get('admin_option')
+        if kind not in {'user', 'group', 'role', 'public'} or not isinstance(name, str) or not name:
+            raise ArchiveError('Grant recipient name/type is missing or unsupported')
+        identifier(name)
+        if type(option) is not bool:
+            raise ArchiveError('Grant option must be a boolean')
+        if privilege in CATALOG_ONLY_PRIVILEGES:
+            ignored.append(grant)
+            continue
+        if privilege not in TABLE_PRIVILEGES:
+            raise ArchiveError(f'Unsupported table privilege: {privilege!r}')
+        if option and kind != 'user':
+            raise ArchiveError('WITH GRANT OPTION is supported here only for database users')
+        key = (kind, name, privilege)
+        normalized[key] = normalized.get(key, False) or option
+    result = [dict(zip(['identity_type', 'identity_name', 'privilege_type', 'admin_option'], (*key, option)))
+              for key, option in sorted(normalized.items())]
+    return result, ignored
+
+
+def read_table_grants(conn, schema, table):
+    rows = conn.run("""SELECT identity_type, identity_name, privilege_type, admin_option
+        FROM svv_relation_privileges
+        WHERE namespace_name=:schema AND relation_name=:table""", schema=schema, table=table)
+    return normalize_table_grants([dict(zip(
+        ['identity_type', 'identity_name', 'privilege_type', 'admin_option'], row)) for row in rows])
+
+
+def capture_table_permissions(conn, schema, table):
+    # Limited catalog visibility can look like an empty/missing grant list.
+    # Require a superuser for a reliable permissions snapshot and verification.
+    admin = conn.run('SELECT usesuper FROM pg_user WHERE usename = CURRENT_USER')
+    if not admin or admin[0][0] is not True:
+        raise ArchiveError('A Redshift superuser connection is required to capture/verify all explicit table grants')
+    grants, ignored = read_table_grants(conn, schema, table)
+    return {'version': 1, 'source': 'svv_relation_privileges', 'visibility': 'superuser',
+            'table_grants': grants, 'catalog_only_grants': ignored,
+            'scope': 'explicit_table_grants_only'}
+
+
 def archive_table(args, table, run_id, endpoint, s3, bucket, base, connection_factory=database_connection):
     prefix = archive_prefix(base, args.database, args.schema, table['name'])
     data_prefix = prefix + 'data/'
     uri = f's3://{bucket}/{prefix}'
-    metadata = {'format_version': 1, 'status': 'in_progress', 'run_id': run_id,
+    metadata = {'format_version': 2, 'status': 'in_progress', 'run_id': run_id,
                 'started_at': utc_now(), 'sdm_resource': args.sdm_name,
                 'database': args.database, 'schema': args.schema, 'table': table['name'],
                 'table_id': table['table_id'], 'owner': table['owner'],
@@ -248,6 +302,7 @@ def archive_table(args, table, run_id, endpoint, s3, bucket, base, connection_fa
             AND CAST(table_schema AS VARCHAR(128))=:schema AND CAST(table_name AS VARCHAR(128))=:table''',
             database=args.database, schema=args.schema, table=table['name'])
         metadata['visible_table_grants'] = [dict(zip(['grantor','grantee','privilege_type','is_grantable'], r)) for r in grants]
+        metadata['permissions'] = capture_table_permissions(conn, args.schema, table['name'])
         metadata['snapshot_started_at'] = utc_now()
         # COUNT and UNLOAD run in the same explicit transaction snapshot.
         source_rows = int(conn.run(f'SELECT COUNT(*) FROM {qualified}')[0][0])

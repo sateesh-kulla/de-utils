@@ -14,6 +14,7 @@ from urllib.parse import unquote
 from archive_redshift_tables import (
     ArchiveError, archive_prefix, connect_sdm, database_connection,
     get_manifest, identifier, literal, s3_location, utc_now, verify_manifest,
+    capture_table_permissions, normalize_table_grants, read_table_grants,
 )
 
 # Recognize quoted identifiers, string literals, and comments before considering
@@ -163,6 +164,11 @@ def prepare_archive(args, s3, bucket, base, table):
     for key, value in [('database', args.database), ('schema', args.schema), ('table', table)]:
         if metadata.get(key) != value:
             raise ArchiveError(f'Archive metadata {key} does not match the selection')
+    permissions = None if args.grants_from_source else archived_permissions(metadata)
+    owner = metadata.get('owner')
+    if not isinstance(owner, str) or not owner.strip():
+        raise ArchiveError('Archive metadata is missing the original table owner')
+    identifier(owner)
     ddl = read_text(s3, bucket, prefix+'ddl.sql')
     if metadata.get('ddl_sha256') != hashlib.sha256(ddl.encode()).hexdigest():
         raise ArchiveError('DDL checksum does not match archive metadata')
@@ -178,10 +184,47 @@ def prepare_archive(args, s3, bucket, base, table):
     rewritten, column_adjustments = quote_ddl_columns(rewritten)
     rewritten, adjustments = normalize_distribution(rewritten)
     adjustments = column_adjustments + adjustments
-    return {'ddl': rewritten, 'ddl_adjustments': adjustments,
+    return {'ddl': rewritten, 'ddl_adjustments': adjustments, 'owner': owner,
+            'permissions': permissions,
             'target_schema': target_schema, 'expected_rows': expected,
             'manifest_uri': f's3://{bucket}/{prefix}data/manifest',
             'archive_uri': f's3://{bucket}/{prefix}', **verified}
+
+
+def archived_permissions(metadata):
+    permissions = metadata.get('permissions')
+    if not isinstance(permissions, dict) or permissions.get('version') != 1:
+        raise ArchiveError('Archive has no typed grant snapshot. Re-archive, or use --grants-from-source if the original table still exists.')
+    if permissions.get('visibility') != 'superuser' or permissions.get('scope') != 'explicit_table_grants_only':
+        raise ArchiveError('Grant snapshot does not confirm full explicit-table visibility')
+    grants, ignored = normalize_table_grants(permissions.get('table_grants'))
+    return {**permissions, 'table_grants': grants,
+            'catalog_only_grants': permissions.get('catalog_only_grants', []) + ignored}
+
+
+def grant_sql(schema, table, grant):
+    # Validate all interpolated privilege/identity-type tokens against allowlists.
+    validated, _ = normalize_table_grants([grant])
+    if not validated:
+        raise ArchiveError('Catalog-only privileges cannot be replayed')
+    g = validated[0]
+    recipient = 'PUBLIC' if g['identity_type'] == 'public' else (
+        {'user': '', 'group': 'GROUP ', 'role': 'ROLE '}[g['identity_type']] + identifier(g['identity_name']))
+    return ('GRANT '+g['privilege_type']+' ON TABLE '+identifier(schema)+'.'+identifier(table)
+            +' TO '+recipient+(' WITH GRANT OPTION' if g['admin_option'] else '')+';')
+
+
+def verify_table_grants(conn, schema, table, expected):
+    actual, _ = read_table_grants(conn, schema, table)
+    def key(g):
+        return g['identity_type'], g['identity_name'], g['privilege_type']
+    available = {key(g): g['admin_option'] for g in actual}
+    missing = [g for g in expected if key(g) not in available or (g['admin_option'] and not available[key(g)])]
+    if missing:
+        raise ArchiveError('Restored table is missing archived grants: '+json.dumps(missing))
+    wanted = {key(g): g['admin_option'] for g in expected}
+    extra = [g for g in actual if key(g) not in wanted or (g['admin_option'] and not wanted[key(g)])]
+    return extra
 
 
 def database_error_fields(exc):
@@ -210,6 +253,7 @@ def restore_table(args, table, prepared, endpoint, connection_factory=database_c
               'expected_rows': prepared['expected_rows'], 'restored_rows': None,
               'archive_uri': prepared['archive_uri'], 'status': 'failed'}
     result['ddl_adjustments'] = prepared.get('ddl_adjustments', [])
+    result['expected_owner'] = prepared.get('owner')
     conn = None
     committed = False
     stage = 'connect'
@@ -224,6 +268,31 @@ def restore_table(args, table, prepared, endpoint, connection_factory=database_c
             AND CAST(c.relname AS VARCHAR(128))=:table''', schema=schema, table=table)
         if existing:
             raise ArchiveError('Destination object already exists; it will not be changed')
+        stage = 'check_permissions'
+        # Full visibility is needed to verify grants, including extra defaults.
+        admin = conn.run('SELECT usesuper FROM pg_user WHERE usename = CURRENT_USER')
+        if not admin or admin[0][0] is not True:
+            raise ArchiveError('A Redshift superuser connection is required to restore and verify permissions')
+        if args.grants_from_source:
+            source = conn.run('''SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE CAST(n.nspname AS VARCHAR(128))=:schema
+                AND CAST(c.relname AS VARCHAR(128))=:table AND c.relkind='r' ''', schema=args.schema, table=table)
+            if not source:
+                raise ArchiveError('Original table is missing; cannot read live source grants')
+            permissions = capture_table_permissions(conn, args.schema, table)
+            result['permissions_source'] = 'live_source_table'
+        else:
+            permissions = archived_permissions({'permissions': prepared.get('permissions')})
+            result['permissions_source'] = 'archive_metadata'
+        grants = permissions['table_grants']
+        result['catalog_only_grants_not_replayed'] = permissions.get('catalog_only_grants', [])
+        stage = 'check_owner'
+        owner = prepared.get('owner')
+        if not isinstance(owner, str) or not owner.strip():
+            raise ArchiveError('Archive metadata is missing the original table owner')
+        identifier(owner)
+        if not conn.run('SELECT 1 FROM pg_user WHERE CAST(usename AS VARCHAR(128))=:owner', owner=owner):
+            raise ArchiveError(f'Archived owner {owner!r} does not exist or is not visible in the destination')
         qualified = identifier(schema)+'.'+identifier(table)
         stage = 'create_schema'
         conn.run('CREATE SCHEMA IF NOT EXISTS '+identifier(schema))
@@ -238,6 +307,25 @@ def restore_table(args, table, prepared, endpoint, connection_factory=database_c
         result['restored_rows'] = restored
         if restored != prepared['expected_rows']:
             raise ArchiveError(f'Row count mismatch: manifest={prepared["expected_rows"]}, restored={restored}')
+        stage = 'restore_grants'
+        for grant in grants:
+            conn.run(grant_sql(schema, table, grant))
+        stage = 'restore_owner'
+        conn.run('ALTER TABLE '+qualified+' OWNER TO '+identifier(owner))
+        stage = 'validate_owner'
+        owners = conn.run('''SELECT CAST(u.usename AS VARCHAR(128))
+            FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+            JOIN pg_user u ON u.usesysid=c.relowner
+            WHERE CAST(n.nspname AS VARCHAR(128))=:schema
+            AND CAST(c.relname AS VARCHAR(128))=:table''', schema=schema, table=table)
+        if not owners or owners[0][0] != owner:
+            raise ArchiveError('Restored table owner does not match the archived owner')
+        result['restored_owner'] = owners[0][0]
+        stage = 'validate_grants'
+        result['extra_table_grants'] = verify_table_grants(conn, schema, table, grants)
+        result['table_grants_restored'] = len(grants)
+        result['permissions_validation'] = 'expected_supported_grants_present'
+        result['schema_usage_validation'] = 'not_checked; review schema/scoped grants separately'
         stage = 'commit'
         conn.run('COMMIT')
         committed = True
@@ -264,6 +352,20 @@ def restore_table(args, table, prepared, endpoint, connection_factory=database_c
     return result
 
 
+def existing_destinations(args, tables, endpoint):
+    """Read all destination names before any restore work begins."""
+    schema = args.schema + '_tmp' if args.test else args.schema
+    conn = database_connection(args, endpoint)
+    try:
+        rows = conn.run('''SELECT CAST(c.relname AS VARCHAR(128))
+            FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE CAST(n.nspname AS VARCHAR(128))=:schema''', schema=schema)
+        selected = set(tables)
+        return sorted({row[0] for row in rows if row[0] in selected})
+    finally:
+        conn.close()
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--sdm-name', required=True)
@@ -272,6 +374,8 @@ def parser():
     p.add_argument('--table', help='One table; omit to restore every table folder in the schema')
     p.add_argument('--s3-prefix', required=True, help='Root before DATABASE/SCHEMA/TABLE folders')
     p.add_argument('--iam-role', required=True, help='Redshift COPY IAM role ARN')
+    p.add_argument('--grants-from-source', action='store_true',
+                   help='Read current explicit grants from the original table, for legacy archives; requires the original table and a superuser')
     p.add_argument('--test', action='store_true', help='Restore into SCHEMA_tmp, keeping original table names')
     p.add_argument('--dry-run', action='store_true', help='Read/validate S3 archives only; no Redshift connection or SQL execution')
     p.add_argument('--aws-profile', help='Omit when running through sdm aws run')
@@ -286,6 +390,8 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.dry_run and args.grants_from_source:
+        raise ArchiveError('--grants-from-source requires a database connection; omit --dry-run to use it. Dry run remains S3-only.')
     for name in [args.database, args.schema, args.schema+'_tmp' if args.test else args.schema]:
         identifier(name)
         if len(name.encode()) > 127:
@@ -306,8 +412,16 @@ def main(argv=None):
     print(json.dumps({'mode': 'dry_run' if args.dry_run else 'restore', 'database': args.database,
                       'destination_schema': args.schema+'_tmp' if args.test else args.schema,
                       'tables': tables}), flush=True)
+    if not args.dry_run:
+        existing = existing_destinations(args, tables, endpoint)
+        if existing:
+            schema = args.schema + '_tmp' if args.test else args.schema
+            print(json.dumps({'status': 'failed', 'failed_step': 'check_destinations',
+                              'destination_schema': schema, 'existing_tables': existing,
+                              'error': 'Destination objects already exist; job aborted before restoring any tables.'}), flush=True)
+            return 1
     results = []
-    for table in tables:
+    for index, table in enumerate(tables):
         try:
             prepared = prepare_archive(args, s3, bucket, base, table)
             if args.dry_run:
@@ -315,6 +429,8 @@ def main(argv=None):
                           'planned_destination_schema': prepared['target_schema'],
                           'database_connected': False, 'destination_existence_checked': False,
                           'ddl_adjustments': prepared.get('ddl_adjustments', []),
+                          'planned_owner': prepared['owner'],
+                          'planned_table_grants': prepared['permissions']['table_grants'],
                           'expected_rows': prepared['expected_rows'], 'archive_uri': prepared['archive_uri']}
             else:
                 result = restore_table(args, table, prepared, endpoint)
@@ -323,6 +439,15 @@ def main(argv=None):
                       'error': str(exc) if isinstance(exc, ArchiveError) else 'Archive validation/access failed; check S3 access and archive files.'}
         results.append(result)
         print(json.dumps(result), flush=True)
+        # Also stop if a destination appears after the initial check. CREATE TABLE
+        # has no IF NOT EXISTS, so a concurrent object cannot receive appended data.
+        if (result.get('failed_step') == 'check_destination' or result.get('sqlstate') == '42P07'):
+            for pending in tables[index+1:]:
+                skipped = {'table': pending, 'status': 'failed', 'failed_step': 'job_aborted',
+                           'error': 'Not attempted because a destination object already exists.'}
+                results.append(skipped)
+                print(json.dumps(skipped), flush=True)
+            break
     failed = sum(r['status']=='failed' for r in results)
     summary = {'completed_at': utc_now(), 'database': args.database, 'test': args.test,
                'dry_run': args.dry_run, 'succeeded': len(results)-failed, 'failed': failed, 'tables': results}
